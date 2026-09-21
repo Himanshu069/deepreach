@@ -94,6 +94,7 @@ class Experiment(ABC):
             loss_fn, clip_grad, use_lbfgs, adjust_relative_grads, 
             val_x_resolution, val_y_resolution, val_z_resolution, val_time_resolution,
             use_CSL, CSL_lr, CSL_dt, epochs_til_CSL, num_CSL_samples, CSL_loss_frac_cutoff, max_CSL_epochs, CSL_loss_weight, CSL_batch_size,
+            checkpoint_toload=None, counter_start=0,
         ):
         was_eval = not self.model.training
         self.model.train()
@@ -121,15 +122,28 @@ class Experiment(ABC):
 
         writer = SummaryWriter(summaries_dir)
 
+        start_epoch = 0
         total_steps = 0
 
+        if checkpoint_toload is not None:
+            ckpt_path = os.path.join(checkpoints_dir, 'model_epoch_%04d.pth' % checkpoint_toload)
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            self.model.load_state_dict(checkpoint['model'])
+            optim.load_state_dict(checkpoint['optimizer'])
+            start_epoch = checkpoint['epoch']
+            total_steps = start_epoch * len(train_dataloader)
+           # restore curriculum counter (verify attribute names against dataio.ReachabilityDataset)
+            self.dataset.counter = min(counter_start + start_epoch, self.dataset.counter_end)
+            tqdm.write('Resuming training from epoch %d' % start_epoch)
+        
         if adjust_relative_grads:
             new_weight = 1
 
         with tqdm(total=len(train_dataloader) * epochs) as pbar:
             train_losses = []
             last_CSL_epoch = -1
-            for epoch in range(0, epochs):
+            pbar.update(total_steps)
+            for epoch in range(start_epoch, epochs):
                 if self.dataset.pretrain: # skip CSL
                     last_CSL_epoch = epoch
                 time_interval_length = (self.dataset.counter/self.dataset.counter_end)*(self.dataset.tMax-self.dataset.tMin)

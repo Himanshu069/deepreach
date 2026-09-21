@@ -105,9 +105,13 @@ if (mode == 'all') or (mode == 'train'):
         else:
             p.add_argument('--' + param, type=dynamics_params[param].annotation, required=True, help='special dynamics_class argument')
 
+if (mode == 'all') or (mode == 'train'):
+    p.add_argument('--checkpoint_toload', type=int, default=None, required=False,
+                    help='Epoch of checkpoint to resume training from (None = train from scratch)')
+
 if (mode == 'all') or (mode == 'test'):
     p.add_argument('--dt', type=float, default=0.0025, help='The dt used in testing simulations')
-    p.add_argument('--checkpoint_toload', type=int, default=None, help="The checkpoint to load for testing (-1 for final training checkpoint, None for cross-checkpoint testing")
+    p.add_argument('--checkpoint_toload_test', type=int, default=None, help="The checkpoint to load for testing (-1 for final training checkpoint, None for cross-checkpoint testing")
     p.add_argument('--num_scenarios', type=int, default=100000, help='The number of scenarios sampled in scenario optimization for testing')
     p.add_argument('--num_violations', type=int, default=1000, help='The number of violations to sample for in scenario optimization for testing')
     p.add_argument('--control_type', type=str, default='value', choices=['value', 'ttr', 'init_ttr'], help='The controller to use in scenario optimization for testing')
@@ -129,12 +133,16 @@ experiment_dir = os.path.join(opt.experiments_dir, opt.experiment_name)
 if (mode == 'all') or (mode == 'train'):
     # create experiment dir
     if os.path.exists(experiment_dir):
-        overwrite = input("The experiment directory %s already exists. Overwrite? (y/n)"%experiment_dir)
-        if not (overwrite == 'y'):
-            print('Exiting.')
-            quit()
-        shutil.rmtree(experiment_dir)     
-    os.makedirs(experiment_dir)
+       if opt.checkpoint_toload is None:
+            overwrite = input("The experiment directory %s already exists. Overwrite? (y/n)"%experiment_dir)
+            if not (overwrite == 'y'):
+                print('Exiting.')
+                quit()
+            shutil.rmtree(experiment_dir)
+            os.makedirs(experiment_dir)
+    else:
+        os.makedirs(experiment_dir)
+
 elif mode == 'test':
     # confirm that experiment dir already exists
     if not os.path.exists(experiment_dir):
@@ -194,12 +202,13 @@ if (mode == 'all') or (mode == 'train'):
         steps_til_summary=orig_opt.steps_til_summary, epochs_til_checkpoint=orig_opt.epochs_til_ckpt, 
         loss_fn=loss_fn, clip_grad=orig_opt.clip_grad, use_lbfgs=orig_opt.use_lbfgs, adjust_relative_grads=orig_opt.adj_rel_grads,
         val_x_resolution=orig_opt.val_x_resolution, val_y_resolution=orig_opt.val_y_resolution, val_z_resolution=orig_opt.val_z_resolution, val_time_resolution=orig_opt.val_time_resolution,
-        use_CSL=orig_opt.use_CSL, CSL_lr=orig_opt.CSL_lr, CSL_dt=orig_opt.CSL_dt, epochs_til_CSL=orig_opt.epochs_til_CSL, num_CSL_samples=orig_opt.num_CSL_samples, CSL_loss_frac_cutoff=orig_opt.CSL_loss_frac_cutoff, max_CSL_epochs=orig_opt.max_CSL_epochs, CSL_loss_weight=orig_opt.CSL_loss_weight, CSL_batch_size=orig_opt.CSL_batch_size)
+        use_CSL=orig_opt.use_CSL, CSL_lr=orig_opt.CSL_lr, CSL_dt=orig_opt.CSL_dt, epochs_til_CSL=orig_opt.epochs_til_CSL, num_CSL_samples=orig_opt.num_CSL_samples, CSL_loss_frac_cutoff=orig_opt.CSL_loss_frac_cutoff, max_CSL_epochs=orig_opt.max_CSL_epochs, CSL_loss_weight=orig_opt.CSL_loss_weight, CSL_batch_size=orig_opt.CSL_batch_size,
+        checkpoint_toload=orig_opt.checkpoint_toload, counter_start=orig_opt.counter_start)
 
 if (mode == 'all') or (mode == 'test'):
     experiment.test(
         device=opt.device, current_time=current_time, 
         last_checkpoint=orig_opt.num_epochs, checkpoint_dt=orig_opt.epochs_til_ckpt, 
-        checkpoint_toload=opt.checkpoint_toload, dt=opt.dt,
+        checkpoint_toload=opt.checkpoint_toload_test, dt=opt.dt,
         num_scenarios=opt.num_scenarios, num_violations=opt.num_violations, 
         set_type='BRT' if orig_opt.minWith in ['zero', 'target'] else 'BRS', control_type=opt.control_type, data_step=opt.data_step)

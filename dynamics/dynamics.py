@@ -1173,3 +1173,157 @@ class MultiVehicleCollision(Dynamics):
             'y_axis_idx': 1,
             'z_axis_idx': 6,
         }
+
+class EstimationAwareAir3D(Dynamics):
+    def __init__(self,
+                 vP:float=0.75, vE:float=0.75,
+                 uP_max:float=3.0, uE_max:float=4.0,
+                 kappa:float=2.0,
+                 Rx:float=0.5, Ry:float=0.5,
+                 Qx:float=0.0, Qy:float=0.0,
+                 Rc:float=1.0,
+                 sigma_eps:float=1e-6,
+                 xy_max:float=3.0,
+                 sigma_lo:float=1e-3, sigma_hi:float=1.0,
+                 sigma_xy_max:float=0.5):
+        self.vP, self.vE = vP, vE
+        self.uP_max, self.uE_max = uP_max, uE_max
+        self.kappa = kappa
+        self.Rx, self.Ry = Rx, Ry
+        self.Qx, self.Qy = Qx, Qy
+        self.Rc = Rc
+        self.sigma_eps = sigma_eps
+        self.xy_max = xy_max
+        self.sigma_lo, self.sigma_hi = sigma_lo, sigma_hi
+        self.sigma_xy_max = sigma_xy_max
+
+        super().__init__(
+            loss_type='brt_hjivi', set_mode='avoid',
+            # state = [x_hat, y_hat, psi, Sxx, Syy, Sxy]
+            state_dim=6, input_dim=7, control_dim=1, disturbance_dim=3,
+            state_mean=[0, 0, math.pi, (sigma_lo+sigma_hi)/2, (sigma_lo+sigma_hi)/2, 0],
+            state_var=[xy_max, xy_max, math.pi, (sigma_hi-sigma_lo)/2, (sigma_hi-sigma_lo)/2, sigma_xy_max],
+            value_mean=xy_max/2,
+            value_var=xy_max,
+            value_normto=0.02,
+            deepreach_model="exact",
+        )
+
+    def state_test_range(self):
+        return [
+            [-self.xy_max, self.xy_max],
+            [-self.xy_max, self.xy_max],
+            [0, 2*math.pi],
+            [self.sigma_lo, self.sigma_hi],
+            [self.sigma_lo, self.sigma_hi],
+            [-self.sigma_xy_max, self.sigma_xy_max],
+        ]
+
+    def equivalent_wrapped_state(self, state):
+        wrapped_state = torch.clone(state)
+        wrapped_state[..., 2] = wrapped_state[..., 2] % (2*math.pi)
+        return wrapped_state
+
+    def _kalman_gain(self, Sxx, Syy, Sxy):
+        K11 = Sxx / self.Rx
+        K12 = Sxy / self.Ry
+        K21 = Sxy / self.Rx
+        K22 = Syy / self.Ry
+        return K11, K12, K21, K22
+
+    def _e_max(self, Sxx, Syy):
+        Sxx_c = torch.clamp(Sxx, min=self.sigma_eps)
+        Syy_c = torch.clamp(Syy, min=self.sigma_eps)
+        return self.kappa*torch.sqrt(Sxx_c), self.kappa*torch.sqrt(Syy_c)
+
+    def _sigma_decay(self, Sxx, Syy, Sxy):
+        dec_xx = Sxx**2/self.Rx + Sxy**2/self.Ry
+        dec_yy = Sxy**2/self.Rx + Syy**2/self.Ry
+        dec_xy = Sxx*Sxy/self.Rx + Sxy*Syy/self.Ry
+        return dec_xx, dec_yy, dec_xy
+
+    def dsdt(self, state, control, disturbance):
+        x_hat, y_hat, psi = state[..., 0], state[..., 1], state[..., 2]
+        Sxx, Syy, Sxy = state[..., 3], state[..., 4], state[..., 5]
+        uP = control[..., 0]
+        uE, ex, ey = disturbance[..., 0], disturbance[..., 1], disturbance[..., 2]
+
+        K11, K12, K21, K22 = self._kalman_gain(Sxx, Syy, Sxy)
+        dec_xx, dec_yy, dec_xy = self._sigma_decay(Sxx, Syy, Sxy)
+
+        dsdt = torch.zeros_like(state)
+        dsdt[..., 0] = self.vP*torch.cos(psi) - self.vE + uE*y_hat + K11*ex + K12*ey
+        dsdt[..., 1] = self.vP*torch.sin(psi) - uE*x_hat + K21*ex + K22*ey
+        dsdt[..., 2] = uP - uE
+        dsdt[..., 3] = 2*uE*Sxy + self.Qx - dec_xx
+        dsdt[..., 4] = -2*uE*Sxy + self.Qy - dec_yy
+        dsdt[..., 5] = uE*(Syy - Sxy) - dec_xy
+        return dsdt
+
+    def boundary_fn(self, state):
+        x_hat, y_hat = state[..., 0], state[..., 1]
+        Sxx, Syy, Sxy = state[..., 3], state[..., 4], state[..., 5]
+        mean = (Sxx + Syy)/2.0
+        half_diff = (Sxx - Syy)/2.0
+        lam_max = mean + torch.sqrt(torch.clamp(half_diff**2 + Sxy**2, min=0.0))
+        return torch.norm(state[..., 0:2], dim=-1) - self.kappa*torch.sqrt(torch.clamp(lam_max, min=0.0)) - self.Rc
+
+    def sample_target_state(self, num_samples):
+        raise NotImplementedError
+
+    def cost_fn(self, state_traj):
+        return torch.min(self.boundary_fn(state_traj), dim=-1).values
+
+    def _hamiltonian_coeffs(self, state, dvds):
+        x_hat, y_hat, psi = state[..., 0], state[..., 1], state[..., 2]
+        Sxx, Syy, Sxy = state[..., 3], state[..., 4], state[..., 5]
+        l_x, l_y, l_psi = dvds[..., 0], dvds[..., 1], dvds[..., 2]
+        l_Sxx, l_Syy, l_Sxy = dvds[..., 3], dvds[..., 4], dvds[..., 5]
+
+        K11, K12, K21, K22 = self._kalman_gain(Sxx, Syy, Sxy)
+        dec_xx, dec_yy, dec_xy = self._sigma_decay(Sxx, Syy, Sxy)
+
+        base = (l_x*(self.vP*torch.cos(psi) - self.vE)
+                + l_y*(self.vP*torch.sin(psi))
+                + l_Sxx*self.Qx + l_Syy*self.Qy
+                - l_Sxx*dec_xx - l_Syy*dec_yy - l_Sxy*dec_xy)
+
+        c_uP = l_psi
+        c_uE = (l_x*y_hat - l_y*x_hat - l_psi
+                + 2*Sxy*(l_Sxx - l_Syy) + l_Sxy*(Syy - Sxx))
+        c_ex = l_x*K11 + l_y*K21
+        c_ey = l_x*K12 + l_y*K22
+        return base, c_uP, c_uE, c_ex, c_ey
+
+    def hamiltonian(self, state, dvds):
+        Sxx, Syy = state[..., 3], state[..., 4]
+        base, c_uP, c_uE, c_ex, c_ey = self._hamiltonian_coeffs(state, dvds)
+        ex_max, ey_max = self._e_max(Sxx, Syy)
+        # control (uP) maximizes, disturbance (uE, ex, ey) minimizes
+        ham = base + self.uP_max*torch.abs(c_uP) \
+                    - self.uE_max*torch.abs(c_uE) \
+                    - ex_max*torch.abs(c_ex) \
+                    - ey_max*torch.abs(c_ey)
+        return ham
+
+    def optimal_control(self, state, dvds):
+        _, c_uP, _, _, _ = self._hamiltonian_coeffs(state, dvds)
+        return (self.uP_max*torch.sign(c_uP))[..., None]
+
+    def optimal_disturbance(self, state, dvds):
+        Sxx, Syy = state[..., 3], state[..., 4]
+        _, _, c_uE, c_ex, c_ey = self._hamiltonian_coeffs(state, dvds)
+        ex_max, ey_max = self._e_max(Sxx, Syy)
+        uE = -self.uE_max*torch.sign(c_uE)
+        ex = -ex_max*torch.sign(c_ex)
+        ey = -ey_max*torch.sign(c_ey)
+        return torch.cat((uE[..., None], ex[..., None], ey[..., None]), dim=-1)
+
+    def plot_config(self):
+        return {
+            'state_slices': [0, 0, math.pi, 0.1, 0.1, 0.0],
+            'state_labels': [r'$\hat x$', r'$\hat y$', r'$\psi$', r'$\Sigma_{xx}$', r'$\Sigma_{yy}$', r'$\Sigma_{xy}$'],
+            'x_axis_idx': 0,
+            'y_axis_idx': 1,
+            'z_axis_idx': 2,
+        }
