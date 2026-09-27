@@ -1181,11 +1181,11 @@ class EstimationAwareAir3D(Dynamics):
                  kappa:float=2.0,
                  Rx:float=0.5, Ry:float=0.5,
                  Qx:float=0.0, Qy:float=0.0,
-                 Rc:float=1.0,
+                 Rc:float=0.25,
                  sigma_eps:float=1e-6,
-                 xy_max:float=3.0,
-                 sigma_lo:float=1e-3, sigma_hi:float=1.0,
-                 sigma_xy_max:float=0.5):
+                 xy_max:float=4.0,
+                 sigma_lo:float=1e-3, sigma_hi:float=0.5,
+                 sigma_xy_max:float=0.25):
         self.vP, self.vE = vP, vE
         self.uP_max, self.uE_max = uP_max, uE_max
         self.kappa = kappa
@@ -1245,8 +1245,8 @@ class EstimationAwareAir3D(Dynamics):
     def dsdt(self, state, control, disturbance):
         x_hat, y_hat, psi = state[..., 0], state[..., 1], state[..., 2]
         Sxx, Syy, Sxy = state[..., 3], state[..., 4], state[..., 5]
-        uP = control[..., 0]
-        uE, ex, ey = disturbance[..., 0], disturbance[..., 1], disturbance[..., 2]
+        uE = control[..., 0]
+        uP, ex, ey = disturbance[..., 0], disturbance[..., 1], disturbance[..., 2]
 
         K11, K12, K21, K22 = self._kalman_gain(Sxx, Syy, Sxy)
         dec_xx, dec_yy, dec_xy = self._sigma_decay(Sxx, Syy, Sxy)
@@ -1257,7 +1257,7 @@ class EstimationAwareAir3D(Dynamics):
         dsdt[..., 2] = uP - uE
         dsdt[..., 3] = 2*uE*Sxy + self.Qx - dec_xx
         dsdt[..., 4] = -2*uE*Sxy + self.Qy - dec_yy
-        dsdt[..., 5] = uE*(Syy - Sxy) - dec_xy
+        dsdt[..., 5] = uE*(Syy - Sxx) - dec_xy
         return dsdt
 
     def boundary_fn(self, state):
@@ -1293,37 +1293,43 @@ class EstimationAwareAir3D(Dynamics):
                 + 2*Sxy*(l_Sxx - l_Syy) + l_Sxy*(Syy - Sxx))
         c_ex = l_x*K11 + l_y*K21
         c_ey = l_x*K12 + l_y*K22
-        return base, c_uP, c_uE, c_ex, c_ey
+        return base, c_uE, c_uP, c_ex, c_ey
 
     def hamiltonian(self, state, dvds):
         Sxx, Syy = state[..., 3], state[..., 4]
-        base, c_uP, c_uE, c_ex, c_ey = self._hamiltonian_coeffs(state, dvds)
+        base, c_uE, c_uP, c_ex, c_ey = self._hamiltonian_coeffs(state, dvds)
         ex_max, ey_max = self._e_max(Sxx, Syy)
-        # control (uP) maximizes, disturbance (uE, ex, ey) minimizes
-        ham = base + self.uP_max*torch.abs(c_uP) \
-                    - self.uE_max*torch.abs(c_uE) \
+        ham = base - self.uP_max*torch.abs(c_uP) \
+                    + self.uE_max*torch.abs(c_uE) \
                     - ex_max*torch.abs(c_ex) \
                     - ey_max*torch.abs(c_ey)
         return ham
 
     def optimal_control(self, state, dvds):
-        _, c_uP, _, _, _ = self._hamiltonian_coeffs(state, dvds)
-        return (self.uP_max*torch.sign(c_uP))[..., None]
+        _, c_uE, _, _, _ = self._hamiltonian_coeffs(state, dvds)
+        return (self.uE_max*torch.sign(c_uE))[..., None]
 
     def optimal_disturbance(self, state, dvds):
         Sxx, Syy = state[..., 3], state[..., 4]
-        _, _, c_uE, c_ex, c_ey = self._hamiltonian_coeffs(state, dvds)
+        _, _, c_uP, c_ex, c_ey = self._hamiltonian_coeffs(state, dvds)
         ex_max, ey_max = self._e_max(Sxx, Syy)
-        uE = -self.uE_max*torch.sign(c_uE)
+        uP = -self.uP_max*torch.sign(c_uP)
         ex = -ex_max*torch.sign(c_ex)
         ey = -ey_max*torch.sign(c_ey)
-        return torch.cat((uE[..., None], ex[..., None], ey[..., None]), dim=-1)
+        return torch.cat((uP[..., None], ex[..., None], ey[..., None]), dim=-1)
 
-    def plot_config(self):
+    def sigma_sweep_values(self):
+        return [0.001, 0.167, 0.334, 0.5]
+
+    def plot_config_for_sigma(self, sigma):
         return {
-            'state_slices': [0, 0, math.pi, 0.1, 0.1, 0.0],
-            'state_labels': [r'$\hat x$', r'$\hat y$', r'$\psi$', r'$\Sigma_{xx}$', r'$\Sigma_{yy}$', r'$\Sigma_{xy}$'],
+            'state_slices': [0, 0, math.pi, sigma, sigma, 0.0],
+            'state_labels': [r'$\hat x$', r'$\hat y$', r'$\psi$',
+                            r'$\Sigma_{xx}$', r'$\Sigma_{yy}$', r'$\Sigma_{xy}$'],
             'x_axis_idx': 0,
             'y_axis_idx': 1,
             'z_axis_idx': 2,
         }
+
+    def plot_config(self):
+        return self.plot_config_for_sigma(0.1)
