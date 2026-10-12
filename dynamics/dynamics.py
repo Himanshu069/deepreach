@@ -197,10 +197,11 @@ class ParameterizedVertDrone2D(Dynamics):
         }
 
 class Air3D(Dynamics):
-    def __init__(self, collisionR:float, velocity:float, omega_max:float, angle_alpha_factor:float):
+    def __init__(self, collisionR:float, velocity:float, omega_max_control:float,  omega_max_dist:float, angle_alpha_factor:float):
         self.collisionR = collisionR
         self.velocity = velocity
-        self.omega_max = omega_max
+        self.omega_max_control = omega_max_control
+        self.omega_max_dist = omega_max_dist
         self.angle_alpha_factor = angle_alpha_factor
         super().__init__(
             loss_type='brt_hjivi', set_mode='avoid',
@@ -246,17 +247,17 @@ class Air3D(Dynamics):
         return torch.min(self.boundary_fn(state_traj), dim=-1).values
     
     def hamiltonian(self, state, dvds):
-        ham = self.omega_max * torch.abs(dvds[..., 0] * state[..., 1] - dvds[..., 1] * state[..., 0] - dvds[..., 2])  # Control component
-        ham = ham - self.omega_max * torch.abs(dvds[..., 2])  # Disturbance component
+        ham = self.omega_max_control * torch.abs(dvds[..., 0] * state[..., 1] - dvds[..., 1] * state[..., 0] - dvds[..., 2])  # Control component
+        ham = ham - self.omega_max_dist * torch.abs(dvds[..., 2])  # Disturbance component
         ham = ham + (self.velocity * (torch.cos(state[..., 2]) - 1.0) * dvds[..., 0]) + (self.velocity * torch.sin(state[..., 2]) * dvds[..., 1])  # Constant component
         return ham
 
     def optimal_control(self, state, dvds):
         det = dvds[..., 0]*state[..., 1] - dvds[..., 1]*state[..., 0]-dvds[..., 2]
-        return (self.omega_max * torch.sign(det))[..., None]
+        return (self.omega_max_control * torch.sign(det))[..., None]
     
     def optimal_disturbance(self, state, dvds):
-        return (-self.omega_max * torch.sign(dvds[..., 2]))[..., None]
+        return (-self.omega_max_dist * torch.sign(dvds[..., 2]))[..., None]
     
     def plot_config(self):
         return {
@@ -1180,12 +1181,13 @@ class EstimationAwareAir3D(Dynamics):
                  uP_max:float=3.0, uE_max:float=4.0,
                  kappa:float=2.0,
                  Rx:float=0.5, Ry:float=0.5,
-                 Qx:float=0.0, Qy:float=0.0,
+                 Qx:float=0.1, Qy:float=0.1,
                  Rc:float=0.25,
-                 sigma_eps:float=1e-6,
+                 sigma_eps:float=1e-4,
                  xy_max:float=4.0,
                  sigma_lo:float=1e-3, sigma_hi:float=0.5,
-                 sigma_xy_max:float=0.25):
+                 sigma_xy_max:float=0.25,
+                 angle_alpha_factor: float = 1.2):
         self.vP, self.vE = vP, vE
         self.uP_max, self.uE_max = uP_max, uE_max
         self.kappa = kappa
@@ -1196,24 +1198,29 @@ class EstimationAwareAir3D(Dynamics):
         self.xy_max = xy_max
         self.sigma_lo, self.sigma_hi = sigma_lo, sigma_hi
         self.sigma_xy_max = sigma_xy_max
+        self.angle_alpha_factor = angle_alpha_factor
 
         super().__init__(
             loss_type='brt_hjivi', set_mode='avoid',
             # state = [x_hat, y_hat, psi, Sxx, Syy, Sxy]
             state_dim=6, input_dim=7, control_dim=1, disturbance_dim=3,
-            state_mean=[0, 0, math.pi, (sigma_lo+sigma_hi)/2, (sigma_lo+sigma_hi)/2, 0],
-            state_var=[xy_max, xy_max, math.pi, (sigma_hi-sigma_lo)/2, (sigma_hi-sigma_lo)/2, sigma_xy_max],
+            state_mean=[0, 0, 0, (sigma_lo+sigma_hi)/2, (sigma_lo+sigma_hi)/2, 0],
+            state_var=[xy_max, xy_max, self.angle_alpha_factor*math.pi, (sigma_hi-sigma_lo)/2, (sigma_hi-sigma_lo)/2, sigma_xy_max],
             value_mean=xy_max/2,
             value_var=xy_max,
             value_normto=0.02,
             deepreach_model="exact",
         )
 
+    def _ssqrt(self, x):
+        """Smooth sqrt: finite gradient at 0, safe for slightly negative x."""
+        return torch.sqrt(torch.clamp(x, min=0.0) + self.sigma_eps)
+    
     def state_test_range(self):
         return [
             [-self.xy_max, self.xy_max],
             [-self.xy_max, self.xy_max],
-            [0, 2*math.pi],
+            [-math.pi, math.pi],
             [self.sigma_lo, self.sigma_hi],
             [self.sigma_lo, self.sigma_hi],
             [-self.sigma_xy_max, self.sigma_xy_max],
@@ -1221,7 +1228,7 @@ class EstimationAwareAir3D(Dynamics):
 
     def equivalent_wrapped_state(self, state):
         wrapped_state = torch.clone(state)
-        wrapped_state[..., 2] = wrapped_state[..., 2] % (2*math.pi)
+        wrapped_state[..., 2] = (wrapped_state[..., 2] + math.pi) % (2*math.pi) - math.pi
         return wrapped_state
 
     def _kalman_gain(self, Sxx, Syy, Sxy):
@@ -1232,9 +1239,7 @@ class EstimationAwareAir3D(Dynamics):
         return K11, K12, K21, K22
 
     def _e_max(self, Sxx, Syy):
-        Sxx_c = torch.clamp(Sxx, min=self.sigma_eps)
-        Syy_c = torch.clamp(Syy, min=self.sigma_eps)
-        return self.kappa*torch.sqrt(Sxx_c), self.kappa*torch.sqrt(Syy_c)
+        return self.kappa*self._ssqrt(Sxx), self.kappa*self._ssqrt(Syy)
 
     def _sigma_decay(self, Sxx, Syy, Sxy):
         dec_xx = Sxx**2/self.Rx + Sxy**2/self.Ry
@@ -1261,12 +1266,11 @@ class EstimationAwareAir3D(Dynamics):
         return dsdt
 
     def boundary_fn(self, state):
-        x_hat, y_hat = state[..., 0], state[..., 1]
         Sxx, Syy, Sxy = state[..., 3], state[..., 4], state[..., 5]
         mean = (Sxx + Syy)/2.0
         half_diff = (Sxx - Syy)/2.0
-        lam_max = mean + torch.sqrt(torch.clamp(half_diff**2 + Sxy**2, min=0.0))
-        return torch.norm(state[..., 0:2], dim=-1) - self.kappa*torch.sqrt(torch.clamp(lam_max, min=0.0)) - self.Rc
+        lam_max = mean + torch.sqrt(half_diff**2 + Sxy**2 + self.sigma_eps**2)
+        return torch.norm(state[..., 0:2], dim=-1) - self.kappa * torch.sqrt(lam_max) - self.Rc
 
     def sample_target_state(self, num_samples):
         raise NotImplementedError
@@ -1323,7 +1327,7 @@ class EstimationAwareAir3D(Dynamics):
 
     def plot_config_for_sigma(self, sigma):
         return {
-            'state_slices': [0, 0, math.pi, sigma, sigma, 0.0],
+            'state_slices': [0, 0, 0, sigma, sigma, 0.0],
             'state_labels': [r'$\hat x$', r'$\hat y$', r'$\psi$',
                             r'$\Sigma_{xx}$', r'$\Sigma_{yy}$', r'$\Sigma_{xy}$'],
             'x_axis_idx': 0,
