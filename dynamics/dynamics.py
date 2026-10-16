@@ -1881,10 +1881,11 @@ class VertDrone2DWithDist(VertDrone2D):
 class Air3D(Dynamics):
     def __init__(self, set_mode: str):
         self.goalR = 0.25
-        self.evader_velocity = 0.6
-        self.pursuer_velocity = 0.6
-        self.omega_max = 2.0
-        self.state_max = 1.5
+        self.evader_velocity = 0.75
+        self.pursuer_velocity = 0.75
+        self.omega_max_control = 4.0
+        self.omega_max_dist = 3.0  
+        self.state_max = 1.0
 
         self.state_range_ = torch.tensor(
             [
@@ -1893,10 +1894,10 @@ class Air3D(Dynamics):
                 [-math.pi, math.pi],
             ]
         ).to(device)
-        self.control_range_ = torch.tensor([[-self.omega_max, self.omega_max]]).to(
+        self.control_range_ = torch.tensor([[-self.omega_max_control, self.omega_max_control]]).to(
             device
         )
-        self.disturbance_range_ = torch.tensor([[-self.omega_max, self.omega_max]]).to(
+        self.disturbance_range_ = torch.tensor([[-self.omega_max_dist, self.omega_max_dist]]).to(
             device
         )
         self.control_init = torch.zeros(1).to(device)
@@ -1996,16 +1997,16 @@ class Air3D(Dynamics):
     def hamiltonian(self, state, dvds):
         x1, x2, x3 = state[..., 0], state[..., 1], state[..., 2]
         dVdx1, dVdx2, dVdx3 = dvds[..., 0], dvds[..., 1], dvds[..., 2]
-        va, vb, w_max = self.evader_velocity, self.pursuer_velocity, self.omega_max
+        va, vb, w_max, d_max = self.evader_velocity, self.pursuer_velocity, self.omega_max_control, self.omega_max_dist
 
         base = -va * dVdx1 + vb * torch.cos(x3) * dVdx1 + vb * torch.sin(x3) * dVdx2
         a_terms = x2 * dVdx1 - x1 * dVdx2 - dVdx3
         b_term = dVdx3
 
         if self.set_mode == "avoid":
-            return base + w_max * torch.abs(a_terms) - w_max * torch.abs(b_term)
+            return base + w_max * torch.abs(a_terms) - d_max * torch.abs(b_term)
         elif self.set_mode == "reach":
-            return base - w_max * torch.abs(a_terms) + w_max * torch.abs(b_term)
+            return base - w_max * torch.abs(a_terms) + d_max * torch.abs(b_term)
         else:
             raise NotImplementedError
 
@@ -2014,18 +2015,18 @@ class Air3D(Dynamics):
         dVdx1, dVdx2, dVdx3 = dvds[..., 0], dvds[..., 1], dvds[..., 2]
         term = x2 * dVdx1 - x1 * dVdx2 - dVdx3
         if self.set_mode == "avoid":
-            return (self.omega_max * torch.sign(term))[..., None]
+            return (self.omega_max_control * torch.sign(term))[..., None]
         elif self.set_mode == "reach":
-            return -(self.omega_max * torch.sign(term))[..., None]
+            return -(self.omega_max_control * torch.sign(term))[..., None]
         else:
             raise NotImplementedError
 
     def optimal_disturbance(self, state, dvds):
         dVdx3 = dvds[..., 2]
         if self.set_mode == "avoid":
-            return -(self.omega_max * torch.sign(dVdx3))[..., None]
+            return -(self.omega_max_dist * torch.sign(dVdx3))[..., None]
         elif self.set_mode == "reach":
-            return (self.omega_max * torch.sign(dVdx3))[..., None]
+            return (self.omega_max_dist * torch.sign(dVdx3))[..., None]
         else:
             raise NotImplementedError
 
