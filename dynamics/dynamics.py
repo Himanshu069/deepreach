@@ -2867,3 +2867,225 @@ class DronePursuitEvasion20D(Dynamics):
             'y_axis_idx': 4,  # y1
             'z_axis_idx': 8,  # z1
         }
+
+class EstimationAwareAir3D(Dynamics):
+    def __init__(self,
+                 vP: float = 0.75, vE: float = 0.75,
+                 uP_max: float = 3.0, uE_max: float = 4.0,
+                 kappa: float = 2.0,
+                 Rx: float = 0.5, Ry: float = 0.5,
+                 Qx: float = 0.1, Qy: float = 0.1,
+                 Rc: float = 0.25,
+                 sigma_eps: float = 1e-4,
+                 xy_max: float = 4.0,
+                 sigma_lo: float = 1e-3, sigma_hi: float = 0.5,
+                 sigma_xy_max: float = 0.25,
+                 angle_alpha_factor: float = 1.2):
+        self.vP, self.vE = vP, vE
+        self.uP_max, self.uE_max = uP_max, uE_max
+        self.kappa = kappa
+        self.Rx, self.Ry = Rx, Ry
+        self.Qx, self.Qy = Qx, Qy
+        self.Rc = Rc
+        self.sigma_eps = sigma_eps
+        self.xy_max = xy_max
+        self.sigma_lo, self.sigma_hi = sigma_lo, sigma_hi
+        self.sigma_xy_max = sigma_xy_max
+        self.angle_alpha_factor = angle_alpha_factor
+
+        # state = [x_hat, y_hat, psi, Sxx, Syy, Sxy]
+        self.state_range_ = torch.tensor([
+            [-xy_max, xy_max],
+            [-xy_max, xy_max],
+            [-math.pi, math.pi],
+            [sigma_lo, sigma_hi],
+            [sigma_lo, sigma_hi],
+            [-sigma_xy_max, sigma_xy_max],
+        ]).to(device)
+
+        # control: uE ; disturbance: [uP, ex, ey]
+        self.control_range_ = torch.tensor([[-uE_max, uE_max]]).to(device)
+        e_hi = kappa * math.sqrt(sigma_hi + sigma_eps)  # static worst-case bound on ex, ey
+        self.disturbance_range_ = torch.tensor([
+            [-uP_max, uP_max],
+            [-e_hi, e_hi],
+            [-e_hi, e_hi],
+        ]).to(device)
+        self.control_init = torch.zeros(1).to(device)
+        self.disturbance_init = torch.zeros(3).to(device)
+        self.eps_var = torch.tensor([uE_max]).to(device)  # tune if your MPC/sampler uses it
+
+        super().__init__(
+            name="EstimationAwareAir3D",
+            loss_type='brt_hjivi', set_mode='avoid',
+            state_dim=6,
+            input_dim=8,  # [t, x, y, sin(psi), cos(psi), Sxx, Syy, Sxy] after periodic_transform_fn
+            control_dim=1, disturbance_dim=3,
+            state_mean=[0, 0, 0, (sigma_lo + sigma_hi) / 2, (sigma_lo + sigma_hi) / 2, 0],
+            state_var=[xy_max, xy_max, angle_alpha_factor * math.pi,
+                       (sigma_hi - sigma_lo) / 2, (sigma_hi - sigma_lo) / 2, sigma_xy_max],
+            value_mean=xy_max / 2,
+            value_var=xy_max,
+            value_normto=0.02,
+            deepReach_model="exact",
+        )
+
+    # ---------- helpers ----------
+    def _ssqrt(self, x):
+        """Smooth sqrt: finite gradient at 0, safe for slightly negative x."""
+        return torch.sqrt(torch.clamp(x, min=0.0) + self.sigma_eps)
+
+    def _kalman_gain(self, Sxx, Syy, Sxy):
+        return Sxx / self.Rx, Sxy / self.Ry, Sxy / self.Rx, Syy / self.Ry
+
+    def _e_max(self, Sxx, Syy):
+        return self.kappa * self._ssqrt(Sxx), self.kappa * self._ssqrt(Syy)
+
+    def _sigma_decay(self, Sxx, Syy, Sxy):
+        dec_xx = Sxx**2 / self.Rx + Sxy**2 / self.Ry
+        dec_yy = Sxy**2 / self.Rx + Syy**2 / self.Ry
+        dec_xy = Sxx * Sxy / self.Rx + Sxy * Syy / self.Ry
+        return dec_xx, dec_yy, dec_xy
+
+    # ---------- ranges / bounds ----------
+    def control_range(self, state):
+        return self.control_range_.cpu().tolist()
+
+    def disturbance_range(self, state):
+        return self.disturbance_range_.cpu().tolist()
+
+    def state_test_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def state_verification_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def clip_state(self, state):
+        return torch.clamp(state, self.state_range_[..., 0], self.state_range_[..., 1])
+
+    def bound_control(self, control):
+        return torch.clamp(control, self.control_range_[..., 0], self.control_range_[..., 1])
+
+    def clamp_control(self, state, control):
+        return self.bound_control(control)
+
+    def bound_disturbance(self, disturbance):
+        # static (worst-case) bound
+        return torch.clamp(disturbance, self.disturbance_range_[..., 0], self.disturbance_range_[..., 1])
+
+    def clamp_disturbance(self, state, disturbance):
+        # state-dependent bound: |ex| <= kappa*sqrt(Sxx), |ey| <= kappa*sqrt(Syy)
+        ex_max, ey_max = self._e_max(state[..., 3], state[..., 4])
+        uP = torch.clamp(disturbance[..., 0], -self.uP_max, self.uP_max)
+        ex = torch.minimum(torch.maximum(disturbance[..., 1], -ex_max), ex_max)
+        ey = torch.minimum(torch.maximum(disturbance[..., 2], -ey_max), ey_max)
+        return torch.stack((uP, ex, ey), dim=-1)
+
+    def equivalent_wrapped_state(self, state):
+        wrapped_state = torch.clone(state)
+        wrapped_state[..., 2] = (wrapped_state[..., 2] + math.pi) % (2 * math.pi) - math.pi
+        return wrapped_state
+
+    def periodic_transform_fn(self, input):
+        # input: [t, x, y, psi, Sxx, Syy, Sxy] (7) -> [t, x, y, sin, cos, Sxx, Syy, Sxy] (8)
+        output_shape = list(input.shape)
+        output_shape[-1] = input.shape[-1] + 1
+        out = torch.zeros(output_shape, device=input.device, dtype=input.dtype)
+        out[..., 0:3] = input[..., 0:3]
+        psi = input[..., 3] * self.state_var[2].to(input.device)
+        out[..., 3] = torch.sin(psi)
+        out[..., 4] = torch.cos(psi)
+        out[..., 5:8] = input[..., 4:7]
+        return out
+
+    # ---------- dynamics ----------
+    def dsdt(self, state, control, disturbance):
+        x_hat, y_hat, psi = state[..., 0], state[..., 1], state[..., 2]
+        Sxx, Syy, Sxy = state[..., 3], state[..., 4], state[..., 5]
+        uE = control[..., 0]
+        uP, ex, ey = disturbance[..., 0], disturbance[..., 1], disturbance[..., 2]
+
+        K11, K12, K21, K22 = self._kalman_gain(Sxx, Syy, Sxy)
+        dec_xx, dec_yy, dec_xy = self._sigma_decay(Sxx, Syy, Sxy)
+
+        dsdt = torch.zeros_like(state)
+        dsdt[..., 0] = self.vP * torch.cos(psi) - self.vE + uE * y_hat + K11 * ex + K12 * ey
+        dsdt[..., 1] = self.vP * torch.sin(psi) - uE * x_hat + K21 * ex + K22 * ey
+        dsdt[..., 2] = uP - uE
+        dsdt[..., 3] = 2 * uE * Sxy + self.Qx - dec_xx
+        dsdt[..., 4] = -2 * uE * Sxy + self.Qy - dec_yy
+        dsdt[..., 5] = uE * (Syy - Sxx) - dec_xy
+        return dsdt
+
+    def boundary_fn(self, state):
+        Sxx, Syy, Sxy = state[..., 3], state[..., 4], state[..., 5]
+        mean = (Sxx + Syy) / 2.0
+        half_diff = (Sxx - Syy) / 2.0
+        lam_max = mean + torch.sqrt(half_diff**2 + Sxy**2 + self.sigma_eps**2)
+        return torch.norm(state[..., 0:2], dim=-1) - self.kappa * torch.sqrt(lam_max) - self.Rc
+
+    def sample_target_state(self, num_samples):
+        raise NotImplementedError
+
+    def cost_fn(self, state_traj):
+        return torch.min(self.boundary_fn(state_traj), dim=-1).values
+
+    def _hamiltonian_coeffs(self, state, dvds):
+        x_hat, y_hat, psi = state[..., 0], state[..., 1], state[..., 2]
+        Sxx, Syy, Sxy = state[..., 3], state[..., 4], state[..., 5]
+        l_x, l_y, l_psi = dvds[..., 0], dvds[..., 1], dvds[..., 2]
+        l_Sxx, l_Syy, l_Sxy = dvds[..., 3], dvds[..., 4], dvds[..., 5]
+
+        K11, K12, K21, K22 = self._kalman_gain(Sxx, Syy, Sxy)
+        dec_xx, dec_yy, dec_xy = self._sigma_decay(Sxx, Syy, Sxy)
+
+        base = (l_x * (self.vP * torch.cos(psi) - self.vE)
+                + l_y * (self.vP * torch.sin(psi))
+                + l_Sxx * self.Qx + l_Syy * self.Qy
+                - l_Sxx * dec_xx - l_Syy * dec_yy - l_Sxy * dec_xy)
+
+        c_uP = l_psi
+        c_uE = (l_x * y_hat - l_y * x_hat - l_psi
+                + 2 * Sxy * (l_Sxx - l_Syy) + l_Sxy * (Syy - Sxx))
+        c_ex = l_x * K11 + l_y * K21
+        c_ey = l_x * K12 + l_y * K22
+        return base, c_uE, c_uP, c_ex, c_ey
+
+    def hamiltonian(self, state, dvds):
+        Sxx, Syy = state[..., 3], state[..., 4]
+        base, c_uE, c_uP, c_ex, c_ey = self._hamiltonian_coeffs(state, dvds)
+        ex_max, ey_max = self._e_max(Sxx, Syy)
+        return (base
+                - self.uP_max * torch.abs(c_uP)
+                + self.uE_max * torch.abs(c_uE)
+                - ex_max * torch.abs(c_ex)
+                - ey_max * torch.abs(c_ey))
+
+    def optimal_control(self, state, dvds):
+        _, c_uE, _, _, _ = self._hamiltonian_coeffs(state, dvds)
+        return (self.uE_max * torch.sign(c_uE))[..., None]
+
+    def optimal_disturbance(self, state, dvds):
+        Sxx, Syy = state[..., 3], state[..., 4]
+        _, _, c_uP, c_ex, c_ey = self._hamiltonian_coeffs(state, dvds)
+        ex_max, ey_max = self._e_max(Sxx, Syy)
+        uP = -self.uP_max * torch.sign(c_uP)
+        ex = -ex_max * torch.sign(c_ex)
+        ey = -ey_max * torch.sign(c_ey)
+        return torch.cat((uP[..., None], ex[..., None], ey[..., None]), dim=-1)
+
+    def sigma_sweep_values(self):
+        return [0.001, 0.167, 0.334, 0.5]
+
+    def plot_config_for_sigma(self, sigma):
+        return {
+            'state_slices': [0, 0, 0, sigma, sigma, 0.0],
+            'state_labels': [r'$\hat x$', r'$\hat y$', r'$\psi$',
+                             r'$\Sigma_{xx}$', r'$\Sigma_{yy}$', r'$\Sigma_{xy}$'],
+            'x_axis_idx': 0,
+            'y_axis_idx': 1,
+            'z_axis_idx': 2,
+        }
+
+    def plot_config(self):
+        return self.plot_config_for_sigma(0.1)

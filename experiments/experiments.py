@@ -1067,6 +1067,9 @@ class Experiment(ABC):
         else:
             fig= self.plotMultipleFigs(
                 state_test_range, plot_config, x_resolution, y_resolution, z_resolution, times)
+
+        fig.savefig(save_path, dpi=150, bbox_inches='tight') 
+        
         if self.use_wandb:
             wandb.log({
                 'step': epoch,
