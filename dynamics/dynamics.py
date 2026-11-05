@@ -3294,7 +3294,7 @@ class EstimationAwarePlanarQuadrotor(Dynamics):
                  thrust_max: float = 8.0, dist_max: float = 0.5,
                  mass: float = 1.0, gravity: float = 9.81,
                  arm_length: float = 0.2, inertia: float = 0.04,
-                 xy_max: float = 3.0, theta_max: float = math.pi / 3,
+                 xy_max: float = 2.5, theta_max: float = math.pi / 3,
                  v_max: float = 2.0, omega_max: float = 4.0,
                  P_lo: float = 1e-3, P_hi: float = 0.05, Pxy_max: float = 0.025,
                  sigma_eps: float = 1e-4):
@@ -3327,7 +3327,7 @@ class EstimationAwarePlanarQuadrotor(Dynamics):
 
         self.control_range_ = torch.tensor([[0.0, thrust_max],
                                             [0.0, thrust_max]]).to(device)
-        e_hi = kappa * math.sqrt(P_hi + sigma_eps)   # static worst-case innovation bound
+        e_hi = kappa * math.sqrt(P_hi + self.r + sigma_eps)   # static worst-case innovation bound
         # disturbance layout: [dx, dy, ex, ey]
         self.disturbance_range_ = torch.tensor([[-dist_max, dist_max],
                                                 [-dist_max, dist_max],
@@ -3370,7 +3370,7 @@ class EstimationAwarePlanarQuadrotor(Dynamics):
         return torch.sqrt(torch.clamp(x, min=0.0) + self.sigma_eps)
 
     def _e_max(self, Pxx, Pyy):
-        return self.kappa * self._ssqrt(Pxx), self.kappa * self._ssqrt(Pyy)
+        return self.kappa * self._ssqrt(Pxx + self.r), self.kappa * self._ssqrt(Pyy + self.r)
 
     def _P_dot(self, Pxx, Pyy, Pxy):
         c = self.c_ric
