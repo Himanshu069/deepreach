@@ -2873,13 +2873,13 @@ class EstimationAwareAir3D(Dynamics):
                  vP: float = 0.75, vE: float = 0.75,
                  uP_max: float = 3.0, uE_max: float = 4.0,
                  kappa: float = 2.0,
-                 Rx: float = 0.5, Ry: float = 0.5,
-                 Qx: float = 0.1, Qy: float = 0.1,
+                 Rx: float = 0.05, Ry: float = 0.05,
+                 Qx: float = 0.05, Qy: float = 0.05,
                  Rc: float = 0.25,
                  sigma_eps: float = 1e-4,
-                 xy_max: float = 4.0,
-                 sigma_lo: float = 1e-3, sigma_hi: float = 0.5,
-                 sigma_xy_max: float = 0.25,
+                 xy_max: float = 2.5,
+                 sigma_lo: float = 1e-3, sigma_hi: float = 0.05,
+                 sigma_xy_max: float = 0.025,
                  angle_alpha_factor: float = 1.2):
         self.vP, self.vE = vP, vE
         self.uP_max, self.uE_max = uP_max, uE_max
@@ -2905,7 +2905,7 @@ class EstimationAwareAir3D(Dynamics):
 
         # control: uE ; disturbance: [uP, ex, ey]
         self.control_range_ = torch.tensor([[-uE_max, uE_max]]).to(device)
-        e_hi = kappa * math.sqrt(sigma_hi + sigma_eps)  # static worst-case bound on ex, ey
+        e_hi = kappa * math.sqrt(sigma_hi + max(Rx, Ry) + sigma_eps)  # static worst-case bound on ex, ey
         self.disturbance_range_ = torch.tensor([
             [-uP_max, uP_max],
             [-e_hi, e_hi],
@@ -2939,7 +2939,7 @@ class EstimationAwareAir3D(Dynamics):
         return Sxx / self.Rx, Sxy / self.Ry, Sxy / self.Rx, Syy / self.Ry
 
     def _e_max(self, Sxx, Syy):
-        return self.kappa * self._ssqrt(Sxx), self.kappa * self._ssqrt(Syy)
+        return (self.kappa * self._ssqrt(Sxx + self.Rx), self.kappa * self._ssqrt(Syy + self.Ry))
 
     def _sigma_decay(self, Sxx, Syy, Sxy):
         dec_xx = Sxx**2 / self.Rx + Sxy**2 / self.Ry
@@ -3075,7 +3075,7 @@ class EstimationAwareAir3D(Dynamics):
         return torch.cat((uP[..., None], ex[..., None], ey[..., None]), dim=-1)
 
     def sigma_sweep_values(self):
-        return [0.001, 0.167, 0.334, 0.5]
+        return [0.001, 0.019, 0.033, 0.050]
 
     def plot_config_for_sigma(self, sigma):
         return {
@@ -3088,7 +3088,7 @@ class EstimationAwareAir3D(Dynamics):
         }
 
     def plot_config(self):
-        return self.plot_config_for_sigma(0.1)
+        return self.plot_config_for_sigma(0.05)
 class PlanarQuadrotor(Dynamics):
     """
     Planar quadrotor, 6D, with bounded wind acceleration.
