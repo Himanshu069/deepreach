@@ -2872,12 +2872,12 @@ class EstimationAwareAir3D(Dynamics):
     def __init__(self,
                  vP: float = 0.75, vE: float = 0.75,
                  uP_max: float = 3.0, uE_max: float = 4.0,
-                 kappa: float = 2.0,
+                 kappa: float = 3.0,
                  Rx: float = 0.05, Ry: float = 0.05,
                  Qx: float = 0.05, Qy: float = 0.05,
                  Rc: float = 0.25,
                  sigma_eps: float = 1e-4,
-                 xy_max: float = 2.5,
+                 xy_max: float = 3.0,
                  sigma_lo: float = 1e-3, sigma_hi: float = 0.05,
                  sigma_xy_max: float = 0.025,
                  angle_alpha_factor: float = 1.2):
@@ -3290,11 +3290,11 @@ class EstimationAwarePlanarQuadrotor(Dynamics):
 
     def __init__(self, set_mode: str = "avoid", collisionR: float = 0.5,
                  q: float = 0.01, r: float = 0.04, gamma: float = 0.4,
-                 kappa: float = 2.0, target_type: str = "circular",
+                 kappa: float = 3.0, target_type: str = "circular",
                  thrust_max: float = 8.0, dist_max: float = 0.5,
                  mass: float = 1.0, gravity: float = 9.81,
                  arm_length: float = 0.2, inertia: float = 0.04,
-                 xy_max: float = 2.5, theta_max: float = math.pi / 3,
+                 xy_max: float = 3.0, theta_max: float = math.pi / 3,
                  v_max: float = 2.0, omega_max: float = 4.0,
                  P_lo: float = 1e-3, P_hi: float = 0.05, Pxy_max: float = 0.025,
                  sigma_eps: float = 1e-4):
