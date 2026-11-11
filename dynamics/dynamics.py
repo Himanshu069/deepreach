@@ -3550,3 +3550,302 @@ class EstimationAwarePlanarQuadrotor(Dynamics):
 
     def plot_config(self):
         return self.plot_config_for_P(0.0231)
+
+
+class EstimationAwareDubins3D(Dynamics):
+    """
+    Dubins car whose full state (x, y, theta) is estimated by a continuous-time EKF.
+    Only position is measured, by a beacon whose noise grows with distance:
+
+        measurement   z = [x, y] + noise,   noise spectral density r(p) I_2
+        r(p)          = r0 + r1 * ||p - beacon||^2
+
+    Belief state (9):  [xh, yh, th, Sxx, Syy, Stt, Sxy, Sxt, Syt]
+    Control:           [omega],          |omega| <= omega_max
+    Disturbance:       [ex, ey]          measurement innovation,
+                                          |e_i| <= kappa * sqrt(S_ii + r(p_hat))
+
+    EKF (H = [I_2 0], A = df/dx at the estimate):
+        A = [[0, 0, -v sin th],
+             [0, 0,  v cos th],
+             [0, 0,  0       ]]
+        K        = Sigma H^T / r                       (3x2)
+        xh'      = v cos th + (Sxx ex + Sxy ey) / r
+        yh'      = v sin th + (Sxy ex + Syy ey) / r
+        th'      = omega    + (Sxt ex + Syt ey) / r
+        Sigma'   = A Sigma + Sigma A^T + Q - Sigma H^T H Sigma / r,   Q = diag(qx, qy, qt)
+
+    Written out entrywise (s = sin th, c = cos th):
+        Sxx' = -2 v s Sxt               + qx - (Sxx^2 + Sxy^2) / r
+        Syy' =  2 v c Syt               + qy - (Sxy^2 + Syy^2) / r
+        Stt' =                            qt - (Sxt^2 + Syt^2) / r
+        Sxy' =  v (c Sxt - s Syt)            - Sxy (Sxx + Syy) / r
+        Sxt' = -v s Stt                      - (Sxx Sxt + Sxy Syt) / r
+        Syt' =  v c Stt                      - (Sxy Sxt + Syy Syt) / r
+
+    Heading is never measured directly; it is corrected only through the cross terms
+    Sxt, Syt.  The control does not appear explicitly in Sigma', but it shapes it through
+    th (in A) and through p (in r(p)): turning toward the beacon buys information.
+
+    Default Sigma box covers the 1st-99th percentile of closed-loop EKF trajectories
+    inside [-3,3]^2 with the default noise (Sxx,Syy <= ~0.17, Stt <= ~0.04, |cross| <= ~0.055).
+    Re-check it if you change r0, r1, q*, or the beacon.
+
+    Failure set: obstacle disc of radius Rc at the origin, inflated by kappa*sqrt(lam_max)
+    of the position block of Sigma (same target as EstimationAwareAir3D).
+    """
+
+    def __init__(self, set_mode: str = "avoid",
+                 velocity: float = 1.0, omega_max: float = 1.2,
+                 kappa: float = 3.0, Rc: float = 0.5,
+                 beacon_x: float = 2.0, beacon_y: float = 0.0,
+                 r0: float = 0.01, r1: float = 0.01,
+                 qx: float = 0.005, qy: float = 0.005, qt: float = 0.01,
+                 xy_max: float = 3.0, angle_alpha_factor: float = 1.2,
+                 S_lo: float = 1e-3, S_hi: float = 0.18,
+                 Stt_lo: float = 1e-3, Stt_hi: float = 0.05,
+                 Sxy_max: float = 0.06, Sxt_max: float = 0.06,
+                 sigma_eps: float = 1e-4):
+        self.v, self.omega_max = velocity, omega_max
+        self.kappa, self.Rc = kappa, Rc
+        self.bx, self.by = beacon_x, beacon_y
+        self.r0, self.r1 = r0, r1
+        self.qx, self.qy, self.qt = qx, qy, qt
+        self.xy_max = xy_max
+        self.sigma_eps = sigma_eps
+        self.set_mode = set_mode
+
+        # state = [xh, yh, th, Sxx, Syy, Stt, Sxy, Sxt, Syt]
+        self.state_range_ = torch.tensor([
+            [-xy_max, xy_max],
+            [-xy_max, xy_max],
+            [-math.pi, math.pi],
+            [S_lo, S_hi],
+            [S_lo, S_hi],
+            [Stt_lo, Stt_hi],
+            [-Sxy_max, Sxy_max],
+            [-Sxt_max, Sxt_max],
+            [-Sxt_max, Sxt_max],
+        ]).to(device)
+
+        self.control_range_ = torch.tensor([[-omega_max, omega_max]]).to(device)
+        # static worst-case innovation bound: largest r(p) on the box
+        far = math.sqrt((xy_max + abs(self.bx)) ** 2 + (xy_max + abs(self.by)) ** 2)
+        self.r_max = r0 + r1 * far ** 2
+        e_hi = kappa * math.sqrt(S_hi + self.r_max + sigma_eps)
+        self.disturbance_range_ = torch.tensor([[-e_hi, e_hi],
+                                                [-e_hi, e_hi]]).to(device)
+        self.control_init = torch.zeros(1).to(device)
+        self.disturbance_init = torch.zeros(2).to(device)
+        self.eps_var = torch.tensor([omega_max]).to(device)
+        self.eps_var_control = torch.tensor([omega_max]).to(device)
+        self.eps_var_disturbance = torch.tensor([e_hi, e_hi]).to(device)
+
+        state_mean_ = (self.state_range_[:, 0] + self.state_range_[:, 1]) / 2.0
+        state_var_ = (self.state_range_[:, 1] - self.state_range_[:, 0]) / 2.0
+        state_var_[2] = angle_alpha_factor * math.pi
+
+        # l(z) range: lam_max of the position block can reach S_hi + Sxy_max at a corner
+        l_min = -Rc - kappa * math.sqrt(S_hi + Sxy_max)
+        l_max = math.sqrt(2.0) * xy_max - Rc
+
+        super().__init__(
+            name="EstimationAwareDubins3D",
+            loss_type="brt_hjivi",
+            set_mode=set_mode,
+            state_dim=9,
+            input_dim=11,  # [t, xh, yh, sin th, cos th, Sxx, Syy, Stt, Sxy, Sxt, Syt]
+            control_dim=1,
+            disturbance_dim=2,
+            state_mean=state_mean_.cpu().tolist(),
+            state_var=state_var_.cpu().tolist(),
+            value_mean=(l_max + l_min) / 2.0,
+            value_var=(l_max - l_min) / 2.0,
+            value_normto=0.02,
+            deepReach_model="exact",
+        )
+
+    # ---------- helpers ----------
+    def _ssqrt(self, x):
+        """Smooth sqrt: finite gradient at 0, safe for slightly negative x."""
+        return torch.sqrt(torch.clamp(x, min=0.0) + self.sigma_eps)
+
+    def _r(self, state):
+        """Measurement noise spectral density at the estimated position."""
+        dx = state[..., 0] - self.bx
+        dy = state[..., 1] - self.by
+        return self.r0 + self.r1 * (dx ** 2 + dy ** 2)
+
+    def _e_max(self, state):
+        r = self._r(state)
+        return (self.kappa * self._ssqrt(state[..., 3] + r),
+                self.kappa * self._ssqrt(state[..., 4] + r))
+
+    def _sigma_dot(self, state):
+        th = state[..., 2]
+        Sxx, Syy, Stt = state[..., 3], state[..., 4], state[..., 5]
+        Sxy, Sxt, Syt = state[..., 6], state[..., 7], state[..., 8]
+        s, c = torch.sin(th), torch.cos(th)
+        v = self.v
+        ir = 1.0 / self._r(state)
+
+        dSxx = -2 * v * s * Sxt + self.qx - (Sxx ** 2 + Sxy ** 2) * ir
+        dSyy = 2 * v * c * Syt + self.qy - (Sxy ** 2 + Syy ** 2) * ir
+        dStt = self.qt - (Sxt ** 2 + Syt ** 2) * ir
+        dSxy = v * (c * Sxt - s * Syt) - Sxy * (Sxx + Syy) * ir
+        dSxt = -v * s * Stt - (Sxx * Sxt + Sxy * Syt) * ir
+        dSyt = v * c * Stt - (Sxy * Sxt + Syy * Syt) * ir
+        return dSxx, dSyy, dStt, dSxy, dSxt, dSyt
+
+    # ---------- ranges / bounds ----------
+    def control_range(self, state):
+        return self.control_range_.cpu().tolist()
+
+    def disturbance_range(self, state):
+        return self.disturbance_range_.cpu().tolist()
+
+    def state_test_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def state_verification_range(self):
+        return self.state_range_.cpu().tolist()
+
+    def clip_state(self, state):
+        return torch.clamp(state, self.state_range_[..., 0], self.state_range_[..., 1])
+
+    def bound_control(self, control):
+        return torch.clamp(control, self.control_range_[..., 0], self.control_range_[..., 1])
+
+    def clamp_control(self, state, control):
+        return self.bound_control(control)
+
+    def bound_disturbance(self, disturbance):
+        # static (worst-case) bound
+        return torch.clamp(disturbance, self.disturbance_range_[..., 0],
+                           self.disturbance_range_[..., 1])
+
+    def clamp_disturbance(self, state, disturbance):
+        # state-dependent bound: |e_i| <= kappa*sqrt(S_ii + r(p_hat))
+        ex_max, ey_max = self._e_max(state)
+        ex = torch.minimum(torch.maximum(disturbance[..., 0], -ex_max), ex_max)
+        ey = torch.minimum(torch.maximum(disturbance[..., 1], -ey_max), ey_max)
+        return torch.stack((ex, ey), dim=-1)
+
+    def equivalent_wrapped_state(self, state):
+        wrapped_state = torch.clone(state)
+        wrapped_state[..., 2] = (wrapped_state[..., 2] + math.pi) % (2 * math.pi) - math.pi
+        return wrapped_state
+
+    def periodic_transform_fn(self, input):
+        # [t, x, y, th, Sxx, Syy, Stt, Sxy, Sxt, Syt] (10) -> [t, x, y, sin, cos, ...6] (11)
+        output_shape = list(input.shape)
+        output_shape[-1] = input.shape[-1] + 1
+        out = torch.zeros(output_shape, device=input.device, dtype=input.dtype)
+        out[..., 0:3] = input[..., 0:3]
+        th = input[..., 3] * self.state_var[2].to(input.device)
+        out[..., 3] = torch.sin(th)
+        out[..., 4] = torch.cos(th)
+        out[..., 5:11] = input[..., 4:10]
+        return out
+
+    # ---------- dynamics ----------
+    def dsdt(self, state, control, disturbance):
+        th = state[..., 2]
+        Sxx, Syy = state[..., 3], state[..., 4]
+        Sxy, Sxt, Syt = state[..., 6], state[..., 7], state[..., 8]
+        omega = control[..., 0]
+        ex, ey = disturbance[..., 0], disturbance[..., 1]
+        ir = 1.0 / self._r(state)
+
+        dSxx, dSyy, dStt, dSxy, dSxt, dSyt = self._sigma_dot(state)
+
+        dsdt = torch.zeros_like(state)
+        dsdt[..., 0] = self.v * torch.cos(th) + (Sxx * ex + Sxy * ey) * ir
+        dsdt[..., 1] = self.v * torch.sin(th) + (Sxy * ex + Syy * ey) * ir
+        dsdt[..., 2] = omega + (Sxt * ex + Syt * ey) * ir
+        dsdt[..., 3] = dSxx
+        dsdt[..., 4] = dSyy
+        dsdt[..., 5] = dStt
+        dsdt[..., 6] = dSxy
+        dsdt[..., 7] = dSxt
+        dsdt[..., 8] = dSyt
+        return dsdt
+
+    # ---------- target / cost ----------
+    def boundary_fn(self, state):
+        Sxx, Syy, Sxy = state[..., 3], state[..., 4], state[..., 6]
+        mean = (Sxx + Syy) / 2.0
+        half_diff = (Sxx - Syy) / 2.0
+        lam_max = mean + torch.sqrt(half_diff ** 2 + Sxy ** 2 + self.sigma_eps ** 2)
+        return torch.norm(state[..., 0:2], dim=-1) - self.kappa * torch.sqrt(lam_max) - self.Rc
+
+    def sample_target_state(self, num_samples):
+        raise NotImplementedError
+
+    def cost_fn(self, state_traj):
+        return torch.min(self.boundary_fn(state_traj), dim=-1).values
+
+    # ---------- Hamiltonian ----------
+    def _hamiltonian_coeffs(self, state, dvds):
+        """<p, F> = base + c_u*omega + c_ex*ex + c_ey*ey"""
+        th = state[..., 2]
+        Sxx, Syy = state[..., 3], state[..., 4]
+        Sxy, Sxt, Syt = state[..., 6], state[..., 7], state[..., 8]
+        l_x, l_y, l_th = dvds[..., 0], dvds[..., 1], dvds[..., 2]
+        ir = 1.0 / self._r(state)
+
+        dS = self._sigma_dot(state)
+        base = self.v * (l_x * torch.cos(th) + l_y * torch.sin(th))
+        for k in range(6):
+            base = base + dvds[..., 3 + k] * dS[k]
+
+        c_u = l_th
+        c_ex = (l_x * Sxx + l_y * Sxy + l_th * Sxt) * ir
+        c_ey = (l_x * Sxy + l_y * Syy + l_th * Syt) * ir
+        return base, c_u, c_ex, c_ey
+
+    def hamiltonian(self, state, dvds):
+        base, c_u, c_ex, c_ey = self._hamiltonian_coeffs(state, dvds)
+        ex_max, ey_max = self._e_max(state)
+        dist_term = ex_max * torch.abs(c_ex) + ey_max * torch.abs(c_ey)
+        if self.set_mode == "avoid":
+            return base + self.omega_max * torch.abs(c_u) - dist_term
+        elif self.set_mode == "reach":
+            return base - self.omega_max * torch.abs(c_u) + dist_term
+        else:
+            raise NotImplementedError
+
+    def optimal_control(self, state, dvds):
+        _, c_u, _, _ = self._hamiltonian_coeffs(state, dvds)
+        if self.set_mode == "avoid":
+            return (self.omega_max * torch.sign(c_u))[..., None]
+        elif self.set_mode == "reach":
+            return (-self.omega_max * torch.sign(c_u))[..., None]
+        else:
+            raise NotImplementedError
+
+    def optimal_disturbance(self, state, dvds):
+        _, _, c_ex, c_ey = self._hamiltonian_coeffs(state, dvds)
+        ex_max, ey_max = self._e_max(state)
+        sgn = -1.0 if self.set_mode == "avoid" else 1.0
+        ex = sgn * ex_max * torch.sign(c_ex)
+        ey = sgn * ey_max * torch.sign(c_ey)
+        return torch.cat((ex[..., None], ey[..., None]), dim=-1)
+
+    # ---------- plotting ----------
+    def sigma_sweep_values(self):
+        return [0.001, 0.05, 0.10, 0.18]
+
+    def plot_config_for_sigma(self, sigma, Stt=0.025):
+        return {
+            "state_slices": [0, 0, 0, sigma, sigma, Stt, 0.0, 0.0, 0.0],
+            "state_labels": [r"$\hat x$", r"$\hat y$", r"$\hat\theta$",
+                             r"$\Sigma_{xx}$", r"$\Sigma_{yy}$", r"$\Sigma_{\theta\theta}$",
+                             r"$\Sigma_{xy}$", r"$\Sigma_{x\theta}$", r"$\Sigma_{y\theta}$"],
+            "x_axis_idx": 0,
+            "y_axis_idx": 1,
+            "z_axis_idx": 2,
+        }
+
+    def plot_config(self):
+        return self.plot_config_for_sigma(0.05)
