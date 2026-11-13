@@ -103,6 +103,7 @@ class ReachabilityDataset(Dataset):
         self.MPC_receding_horizon = MPC_receding_horizon
         self.MPC_dt = MPC_dt
         self.policy = policy
+        self.mpc_data_dir = "./data"          # run_experiment sets a per-run directory
         self.num_MPC_batches = num_MPC_batches
         self.time_till_refinement = time_till_refinement
         self.MPC_data_path = MPC_data_path
@@ -225,6 +226,31 @@ class ReachabilityDataset(Dataset):
             MPC_values = torch.cat([MPC_values[idxs, ...], MPC_values_], dim=0)
         return MPC_inputs, MPC_values
 
+    def _store_MPC_data(self, MPC_inputs, MPC_values):
+        """Filter the MPC labels and expose them as memory-mapped tensors.
+        Non-finite or absurd labels are dropped (one bad label can blow up training), and the files go
+        to a per-run directory (the old ./data/MPC_*_gpu<id>.npy was shared by every run on a machine,
+        so concurrent runs overwrote each other's labels)."""
+        n_all = MPC_inputs.shape[0]
+        ok = torch.isfinite(MPC_inputs).reshape(n_all, -1).all(dim=-1)
+        ok &= torch.isfinite(MPC_values).reshape(n_all, -1).all(dim=-1)
+        ok &= (MPC_values.reshape(n_all, -1).abs() <= 10.0 * abs(self.dynamics.value_var) + 10.0).all(dim=-1)
+        if (~ok).any():
+            print("MPC labels: dropped %d of %d (non-finite or |V| too large)" % (int((~ok).sum()), n_all))
+            MPC_inputs, MPC_values = MPC_inputs[ok], MPC_values[ok]
+        data_dir = getattr(self, "mpc_data_dir", "./data")
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir)
+        device_id = os.environ.get("CUDA_VISIBLE_DEVICES")
+        f_in = os.path.join(data_dir, "MPC_inputs_gpu%s.npy" % device_id)
+        f_val = os.path.join(data_dir, "MPC_values_gpu%s.npy" % device_id)
+        np.save(f_in, MPC_inputs.cpu().numpy(), allow_pickle=False)
+        np.save(f_val, MPC_values.cpu().numpy(), allow_pickle=False)
+        self.MPC_inputs = torch.from_numpy(np.load(f_in, mmap_mode="r")).detach()
+        self.MPC_values = torch.from_numpy(np.load(f_val, mmap_mode="r")).detach()
+        self.mpc_time_sorted_indices = torch.argsort(self.MPC_inputs[:, 0])
+        print("Generated %d labels" % MPC_inputs.shape[0])
+
     def generate_MPC_dataset(self, T, t, style="random"):
         print("Generating MPC dataset")
         mpc_fn = MPC.MPC(
@@ -243,30 +269,7 @@ class ReachabilityDataset(Dataset):
         )
         MPC_inputs, MPC_values = self.collect_MPC_io(mpc_fn, T, t, style=style)
 
-        # convert to memory-mapped tensor for faster query
-        if not os.path.exists("./data"):
-            os.makedirs("./data")
-        device_id = os.environ.get("CUDA_VISIBLE_DEVICES")
-        np.save(
-            "./data/MPC_inputs_gpu%s.npy" % device_id,
-            MPC_inputs.cpu().numpy(),
-            allow_pickle=False,
-        )
-        np.save(
-            "./data/MPC_values_gpu%s.npy" % device_id,
-            MPC_values.cpu().numpy(),
-            allow_pickle=False,
-        )
-        MPC_inputs_mmap = np.load(
-            "./data/MPC_inputs_gpu%s.npy" % device_id, mmap_mode="r"
-        )
-        MPC_values_mmap = np.load(
-            "./data/MPC_values_gpu%s.npy" % device_id, mmap_mode="r"
-        )
-        self.MPC_inputs = torch.from_numpy(MPC_inputs_mmap).detach()
-        self.MPC_values = torch.from_numpy(MPC_values_mmap).detach()
-        self.mpc_time_sorted_indices = torch.argsort(self.MPC_inputs[:, 0])
-        print("Generated %d labels" % MPC_inputs.shape[0])
+        self._store_MPC_data(MPC_inputs, MPC_values)
 
         del mpc_fn
         gc.collect()
@@ -479,29 +482,7 @@ class RobustReachabilityDataset(ReachabilityDataset):
             MPC_inputs = mpc_input_control
             MPC_values = MPC_values_control
 
-        if not os.path.exists("./data"):
-            os.makedirs("./data")
-        device_id = os.environ.get("CUDA_VISIBLE_DEVICES")
-        np.save(
-            "./data/MPC_inputs_gpu%s.npy" % device_id,
-            MPC_inputs.cpu().numpy(),
-            allow_pickle=False,
-        )
-        np.save(
-            "./data/MPC_values_gpu%s.npy" % device_id,
-            MPC_values.cpu().numpy(),
-            allow_pickle=False,
-        )
-        MPC_inputs_mmap = np.load(
-            "./data/MPC_inputs_gpu%s.npy" % device_id, mmap_mode="r"
-        )
-        MPC_values_mmap = np.load(
-            "./data/MPC_values_gpu%s.npy" % device_id, mmap_mode="r"
-        )
-        self.MPC_inputs = torch.from_numpy(MPC_inputs_mmap).detach()
-        self.MPC_values = torch.from_numpy(MPC_values_mmap).detach()
-        self.mpc_time_sorted_indices = torch.argsort(self.MPC_inputs[:, 0])
-        print("Generated %d labels" % MPC_inputs.shape[0])
+        self._store_MPC_data(MPC_inputs, MPC_values)
 
         gc.collect()
         torch.cuda.empty_cache()

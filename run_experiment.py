@@ -679,6 +679,28 @@ if (mode == "all") or (mode == "train"):
 with open(os.path.join(experiment_dir, "orig_opt.pickle"), "rb") as opt_file:
     orig_opt = pickle.load(opt_file)
 
+# RESUME: reuse the ORIGINAL run's settings (dynamics, network, MPC, curriculum), so the resume
+# command only needs --experiment_name, --dynamics_class and --resume_checkpoint. Only --clip_grad
+# (if > 0) is taken from this command. The merged settings are written to this run's config/pickle.
+resume_state = None
+if (mode == "train") and (opt.resume_checkpoint > 0):
+    base_dir = experiment_dir.split("_cond")[0]
+    with open(os.path.join(base_dir, "orig_opt.pickle"), "rb") as opt_file:
+        base_opt = pickle.load(opt_file)
+    if opt.clip_grad > 0:
+        base_opt.clip_grad = opt.clip_grad
+    base_opt.resume_checkpoint = opt.resume_checkpoint
+    base_opt.use_wandb = opt.use_wandb
+    orig_opt = base_opt
+    with open(os.path.join(experiment_dir, "orig_opt.pickle"), "wb") as opt_file:
+        pickle.dump(orig_opt, opt_file)
+    for f_ in os.listdir(experiment_dir):
+        if f_.startswith("config_") and f_.endswith(".txt"):
+            with open(os.path.join(experiment_dir, f_), "w") as f:
+                for arg, val in vars(orig_opt).items():
+                    f.write(arg + " = " + str(val) + "\n")
+    print(f"resume: settings loaded from {base_dir}/orig_opt.pickle (clip_grad={orig_opt.clip_grad})")
+
 # set the experiment seed
 # torch.manual_seed(orig_opt.seed)
 torch.manual_seed(12)
@@ -694,7 +716,10 @@ dynamics = dynamics_class(
     }
 )
 if (mode == "train") and (opt.resume_checkpoint > 0):
-    orig_opt.counter_start = opt.resume_checkpoint
+    # the curriculum counter only advances after pretraining, so at global epoch E it equals
+    # E - pretrain_iters (it was set to E before, which skipped pretrain_iters of the curriculum)
+    pre = orig_opt.pretrain_iters if orig_opt.pretrain else 0
+    orig_opt.counter_start = max(0, opt.resume_checkpoint - pre)
     orig_opt.pretrain = False
     orig_opt.num_epochs -= opt.resume_checkpoint
 
@@ -735,14 +760,18 @@ if orig_opt.pretrained_model != "none":
 
 elif (mode == "train") and (opt.resume_checkpoint > 0):
     experiment_original_dir = experiment_dir.split("_cond")[0]
-    model.load_state_dict(
-        torch.load(
-            os.path.join(
-                "%s/training/checkpoints/model_epoch_%04d.pth"
-                % (experiment_original_dir, opt.resume_checkpoint)
-            )
-        )["model"]
+    ckpt_ = torch.load(
+        os.path.join(
+            "%s/training/checkpoints/model_epoch_%04d.pth"
+            % (experiment_original_dir, opt.resume_checkpoint)
+        ),
+        map_location=device,
     )
+    model.load_state_dict(ckpt_["model"])
+    bad_ = sum(int((~torch.isfinite(v)).sum()) for v in ckpt_["model"].values())
+    if bad_:
+        raise RuntimeError(f"checkpoint {opt.resume_checkpoint} has {bad_} non-finite weights; resume from an earlier one")
+    resume_state = dict(optimizer=ckpt_.get("optimizer"), epoch_offset=opt.resume_checkpoint)
     policy = model
 
 if dynamics.disturbance_dim == 0:
@@ -787,6 +816,9 @@ dataset = dataset_type(
     MPC_integration_method=orig_opt.MPC_integration_method,
     MPC_nbr_action_repeats=orig_opt.MPC_nbr_action_repeats,
 )
+
+# per-run MPC label files (the default ./data/MPC_*_gpu<id>.npy is shared by every run on a machine)
+dataset.mpc_data_dir = os.path.join(experiment_dir, "mpc_data")
 
 experiment_class = getattr(experiments, orig_opt.experiment_class)
 experiment = experiment_class(
@@ -840,6 +872,7 @@ if (mode == "all") or (mode == "train"):
         MPC_importance_init=orig_opt.MPC_importance_init,
         MPC_importance_final=orig_opt.MPC_importance_final,
         MPC_decay_scheme=orig_opt.MPC_decay_scheme,
+        resume_state=resume_state,
     )
 
 if (mode == "all") or (mode == "test"):

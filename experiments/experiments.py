@@ -65,7 +65,8 @@ class Experiment(ABC):
 
     def train(
         self, batch_size, epochs, lr, steps_til_summary, epochs_til_checkpoint, loss_fn, clip_grad, use_lbfgs, adjust_relative_grads,
-        val_x_resolution, val_y_resolution, val_z_resolution, val_time_resolution, MPC_importance_init, MPC_importance_final, MPC_decay_scheme
+        val_x_resolution, val_y_resolution, val_z_resolution, val_time_resolution, MPC_importance_init, MPC_importance_final, MPC_decay_scheme,
+        resume_state=None
     ):
         was_eval = not self.model.training
         self.MPC_importance_init=MPC_importance_init
@@ -115,6 +116,21 @@ class Experiment(ABC):
             )
         self.use_MPC_terminal_loss=False
 
+        # RESUME: epochs are numbered globally (checkpoint names, scheduler, refinement), the optimizer
+        # state is restored, and the MPC data of the last refinement is regenerated (it is not stored).
+        epoch_offset = 0
+        n_skipped = 0
+        if resume_state is not None:
+            epoch_offset = int(resume_state.get("epoch_offset", 0))
+            if resume_state.get("optimizer") is not None:
+                try:
+                    self.optim.load_state_dict(resume_state["optimizer"])
+                    print("resume: optimizer state restored (lr=%g)" % self.optim.param_groups[0]["lr"])
+                except Exception as e:
+                    print("resume: optimizer state NOT restored:", e)
+            if self.dataset.use_MPC and self.dataset.refine_dataset:
+                self._resume_mpc_data()
+
         with tqdm(total=len(train_dataloader) * epochs) as pbar:
             train_losses = []
             for epoch in range(0, epochs):
@@ -123,7 +139,7 @@ class Experiment(ABC):
                                            self.dataset.counter/self.dataset.counter_end)*(self.dataset.tMax-self.dataset.tMin)
                 
                 if self.dataset.refine_dataset:
-                    self.dataset_refinement(time_interval_length, epoch)
+                    self.dataset_refinement(time_interval_length, epoch + epoch_offset)
                     
 
                 # semi-supervised learning
@@ -178,7 +194,7 @@ class Experiment(ABC):
 
                     # Adjust the relative magnitude of the losses if required
                     if adjust_relative_grads:
-                        self.adjust_rel_weight(losses, MPC_decay_scheme, epoch, epochs, model_input)
+                        self.adjust_rel_weight(losses, MPC_decay_scheme, epoch + epoch_offset, epochs + epoch_offset, model_input)
                             
                     # scale losses and step the optimizer
                     train_loss = 0.
@@ -193,7 +209,12 @@ class Experiment(ABC):
                     writer.add_scalar("total_train_loss",
                                       train_loss, total_steps)
 
-                    if not use_lbfgs:
+                    if not use_lbfgs and not torch.isfinite(train_loss):
+                        # a single bad batch must not turn every weight into NaN
+                        self.optim.zero_grad()
+                        n_skipped += 1
+                        tqdm.write("Epoch %d: non-finite loss, step skipped (%d so far)" % (epoch + epoch_offset, n_skipped))
+                    elif not use_lbfgs:
                         self.optim.zero_grad()
                         train_loss.backward()
 
@@ -206,7 +227,7 @@ class Experiment(ABC):
                                     self.model.parameters(), max_norm=clip_grad)
 
                         self.optim.step()
-                        if epoch > (self.dataset.counter_end + self.dataset.pretrain_iters):
+                        if epoch + epoch_offset > (self.dataset.counter_end + self.dataset.pretrain_iters):
                             scheduler.step()
 
                     pbar.update(1)
@@ -227,17 +248,18 @@ class Experiment(ABC):
                     total_steps += 1
 
                 if not (epoch+1) % epochs_til_checkpoint:
+                    ge = epoch + 1 + epoch_offset          # global epoch
                     # Saving the optimizer state is important to produce consistent results
                     checkpoint = {
-                        'epoch': epoch+1,
+                        'epoch': ge,
                         'model': self.model.state_dict(),
                         'optimizer': self.optim.state_dict()}
                     torch.save(checkpoint,
-                               os.path.join(checkpoints_dir, 'model_epoch_%04d.pth' % (epoch+1)))
-                    np.savetxt(os.path.join(checkpoints_dir, 'train_losses_epoch_%04d.txt' % (epoch+1)),
+                               os.path.join(checkpoints_dir, 'model_epoch_%04d.pth' % ge))
+                    np.savetxt(os.path.join(checkpoints_dir, 'train_losses_epoch_%04d.txt' % ge),
                                np.array(train_losses))
                     self.validate(
-                        epoch=epoch+1, save_path=os.path.join(checkpoints_dir, 'BRS_validation_plot_epoch_%04d.png' % (epoch+1)),
+                        epoch=ge, save_path=os.path.join(checkpoints_dir, 'BRS_validation_plot_epoch_%04d.png' % ge),
                         x_resolution=val_x_resolution, y_resolution=val_y_resolution, z_resolution=val_z_resolution, time_resolution=val_time_resolution)
 
         torch.save(checkpoint, os.path.join(
@@ -1105,7 +1127,9 @@ class Experiment(ABC):
             # num = torch.max(torch.abs(grads_PDE))
             num = torch.mean(torch.abs(grads_PDE))
             den = torch.mean(torch.abs(grads_dirichlet))
-            self.loss_weights['dirichlet'] = 0.9*self.loss_weights['dirichlet'] + 0.1*num/den
+            w_new = 0.9*self.loss_weights['dirichlet'] + 0.1*num/den
+            if torch.isfinite(torch.as_tensor(w_new)):
+                self.loss_weights['dirichlet'] = w_new
             losses['dirichlet'] = self.loss_weights['dirichlet'] * \
                 losses['dirichlet']
             if (self.dataset.counter>=1) and len(model_input['MPC_inputs'].shape)>2:
@@ -1130,7 +1154,9 @@ class Experiment(ABC):
                 # Set the new weight according to the paper 
                 den = torch.mean(torch.abs(grads_mpc))
                 
-                self.loss_weights['mpc_loss'] = 0.9*self.loss_weights['mpc_loss'] + 0.1*self.mpc_importance_coef*num/(den+1e-16)
+                w_new = 0.9*self.loss_weights['mpc_loss'] + 0.1*self.mpc_importance_coef*num/(den+1e-16)
+                if torch.isfinite(torch.as_tensor(w_new)):
+                    self.loss_weights['mpc_loss'] = w_new
                 
         elif self.dataset.dynamics.deepReach_model == 'exact' and (self.dataset.counter>=1) and losses['mpc_loss'] > 1e-8:
 
@@ -1169,6 +1195,31 @@ class Experiment(ABC):
             num = torch.mean(torch.abs(grads_PDE))
             
             self.loss_weights['mpc_loss'] =min( 0.9*self.loss_weights['mpc_loss'] + 0.1*self.mpc_importance_coef*num/(den+1e-16), 1e5)
+
+    def _resume_mpc_data(self):
+        """On resume, rebuild the MPC dataset of the last refinement before the checkpoint (MPC data is
+        not stored in checkpoints), mirroring dataset_refinement for that refinement."""
+        ds = self.dataset
+        ds.policy = self.model
+        if ds.refinement_schedule is not None:
+            print("resume: refinement_schedule is set; MPC data is regenerated at the next scheduled refinement")
+            return
+        r = self.last_refine_time
+        if r <= 0:
+            return                                    # no refinement had happened yet
+        refine_till_t = r + ds.time_till_refinement
+        if refine_till_t < ds.tMax - 1e-9:
+            print("resume: regenerating MPC data of the refinement at t=%.2f" % r)
+            ds.generate_MPC_dataset(refine_till_t, r, style="random")
+        else:                                         # the run was already in the terminal phase
+            print("resume: regenerating terminal MPC data (terminal phase, lr=1e-6)")
+            ds.use_terminal_MPC()
+            for g in self.optim.param_groups:
+                g['lr'] = 1e-6
+            self.use_MPC_terminal_loss = True
+            self.MPC_importance_final = 1.0
+            self.MPC_importance_init = 1.0
+            ds.generate_MPC_dataset(ds.tMax, ds.tMax, style="terminal")
 
     def dataset_refinement(self, time_interval_length, epoch):
         should_refine = False
